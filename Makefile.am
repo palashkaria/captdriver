@@ -1,7 +1,10 @@
-SUBDIRS = src tests
+SUBDIRS = src persistent tests
 
-dist_doc_DATA = SPECS INSTALL.git
-EXTRA_DIST = src/canon-lbp.drv ppd
+dist_doc_DATA = SPECS INSTALL.git README.md docs/CHANGES.md docs/PROVENANCE.md
+EXTRA_DIST = src/canon-lbp.drv ppd examples/proxmox/README.md \
+    examples/proxmox/canon-printer-sync \
+    examples/proxmox/canon-printer-sync.service \
+    examples/proxmox/canon-printer-sync.timer
 nodist_data_DATA = Makefile.in
 
 ppd: src/canon-lbp.drv

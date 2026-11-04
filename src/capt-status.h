@@ -209,6 +209,27 @@ static inline bool FLAG(const struct capt_status_s *status, enum capt_flags flag
  * ---------------------------------------------------------------------------*/
 #define CAPT_GO_ONLINE_MAGIC "\xee\xdb\xea\xad"
 
+/* ---------------------------------------------------------------------------
+ * Driver-side bounded-wait timeouts (not protocol constants).  Generous
+ * enough to cover worst-case physical engine drain / paper delivery on a
+ * complex or dense page, but finite so a genuine engine wedge is reported
+ * (see capt_log_status()) instead of hanging the backend process forever.
+ * ---------------------------------------------------------------------------*/
+#define CAPT_WAIT_READY_TIMEOUT_MS      30000 /* capt_wait_ready/xready(_only) */
+#define CAPT_ENGINE_IDLE_TIMEOUT_MS     30000 /* capt_wait_engine_idle (job epilogue) */
+#define CAPT_BUFLEVEL_DRAIN_TIMEOUT_MS  60000 /* ops_send_band_hiscoa BufLevel==0 drain */
+
+/* ---------------------------------------------------------------------------
+ * CUPS printer-state-reason emitted on stderr as "STATE: +reason" / "STATE:
+ * -reason" (a filter/backend convention CUPS parses from job output) when
+ * ReserveUnit's error-recovery sequence fails to clear the engine's error
+ * bit -- a confirmed hard wedge with no further command-level recovery known
+ * to this driver.  Lets the queue / a companion script hold the printer and
+ * alert a human instead of every queued job independently rediscovering the
+ * same failure a few seconds apart.
+ * ---------------------------------------------------------------------------*/
+#define CAPT_STATE_ENGINE_WEDGED "com.captdriver.engine-wedged"
+
 void capt_init_status(void);
 const struct capt_status_s *capt_get_status(void);
 const struct capt_status_s *capt_get_xstatus_only(void);
@@ -216,3 +237,5 @@ const struct capt_status_s *capt_get_xstatus(void);
 void capt_wait_ready(void);
 void capt_wait_xready(void);
 void capt_wait_xready_only(void);
+bool capt_wait_engine_idle(unsigned timeout_ms);
+void capt_log_status(const char *tag, const struct capt_status_s *s);

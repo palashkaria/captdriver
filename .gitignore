@@ -15,3 +15,14 @@ depcomp
 install-sh
 missing
 src/rastertocapt
+
+persistent/capt
+persistent/captd
+persistent/captd.service
+test-driver
+*.log
+*.trs
+tests/captdefilter
+tests/test-hiscoa
+ppd/
+INSTALL

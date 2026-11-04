@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh the Canon printer container USB mapping
+After=pve-cluster.service
+Before=pve-guests.service
+Requires=pve-cluster.service
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/default/canon-printer-sync
+ExecStart=/usr/local/sbin/canon-printer-sync
+TimeoutStartSec=90
+[Install]
+WantedBy=multi-user.target

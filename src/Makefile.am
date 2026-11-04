@@ -1,4 +1,5 @@
-bin_PROGRAMS = rastertocapt
+cupsfilterdir = $(CUPS_SERVERBIN)/filter
+cupsfilter_PROGRAMS = rastertocapt
 
 rastertocapt_SOURCES = rastertocapt.c \
     std.h \

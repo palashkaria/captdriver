@@ -1,0 +1,20 @@
+[Unit]
+Description=Persistent Canon LBP2900 USB printing session
+After=local-fs.target
+Before=cups.service
+StartLimitIntervalSec=0
+[Service]
+Type=simple
+ExecStart=@CAPTD_EXECUTABLE@ /run/captd/lbp2900.sock
+Restart=always
+RestartSec=5
+RuntimeDirectory=captd
+RuntimeDirectoryMode=0700
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+TimeoutStopSec=10
+[Install]
+WantedBy=multi-user.target

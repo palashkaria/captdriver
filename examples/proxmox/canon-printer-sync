@@ -1,0 +1,37 @@
+#!/bin/bash
+set -euo pipefail
+: "${CT_ID:?Set CT_ID to the dedicated printer container ID}"
+[[ "$CT_ID" =~ ^[0-9]+$ ]] || { echo "Invalid CT_ID" >&2; exit 2; }
+exec 9>/run/lock/canon-printer-sync.lock
+flock -n 9 || exit 0
+config="/etc/pve/lxc/${CT_ID}.conf"
+[ -f "$config" ] || exit 0
+node=
+for device in /sys/bus/usb/devices/*; do
+  [ -f "$device/idVendor" ] && [ -f "$device/idProduct" ] || continue
+  [ "$(cat "$device/idVendor")" = 04a9 ] && [ "$(cat "$device/idProduct")" = 2676 ] || continue
+  printf -v node '/dev/bus/usb/%03d/%03d' "$(cat "$device/busnum")" "$(cat "$device/devnum")"
+  break
+done
+signature=absent
+if [ -n "$node" ] && [ -c "$node" ]; then
+  signature="$node:$(stat -Lc '%i:%t:%T' "$node")"
+fi
+previous=$(cat /run/canon-printer-usb-state 2>/dev/null || true)
+[ "$signature" != "$previous" ] || exit 0
+running=0
+pct status "$CT_ID" | grep -q 'status: running' && running=1
+# Stop before changing dev0: Proxmox live replacement fails when the old USB node has disappeared.
+if [ "$running" = 1 ]; then
+  pct shutdown "$CT_ID" --timeout 30
+fi
+if [ "$signature" = absent ]; then
+  if grep -q '^dev0:' "$config"; then pct set "$CT_ID" --delete dev0; fi
+else
+  pct set "$CT_ID" --dev0 "path=$node,uid=0,gid=7,mode=0660"
+fi
+# Recreate only this container's single-device mount after USB reconnects.
+if [ "$running" = 1 ]; then
+  pct start "$CT_ID"
+fi
+printf '%s\n' "$signature" > /run/canon-printer-usb-state

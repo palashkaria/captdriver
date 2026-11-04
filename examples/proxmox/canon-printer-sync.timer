@@ -1,0 +1,8 @@
+[Unit]
+Description=Detect Canon printer reconnects
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=15s
+AccuracySec=2s
+[Install]
+WantedBy=timers.target

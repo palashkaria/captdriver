@@ -12,3 +12,9 @@ test_hiscoa_SOURCES = test-hiscoa.c \
 	$(hiscoa_decompress)
 
 AM_CFLAGS = -std=c99 -Wall -Wextra -pedantic -I../src
+
+EXTRA_DIST = test-backend-drain.py
+if PERSISTENT_USB
+TESTS = test-backend-drain.py
+AM_TESTS_ENVIRONMENT = CAPT_BACKEND='$(abs_top_builddir)/persistent/capt'; export CAPT_BACKEND;
+endif

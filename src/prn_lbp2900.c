@@ -254,6 +254,7 @@ static void lbp2900_job_prologue(struct printer_state_s *state)
 
 	capt_sendrecv(CAPT_START_0, NULL, 0, NULL, 0);
 	job = capt_reserve_unit(state);
+	fprintf(stderr, "DEBUG: CAPT: this job's real CAPT JobID=%u\n", (unsigned)job);
 
 	capt_sendrecv(CAPT_SET_LED_STATUS, lbp3010_gpio_init, ARRAY_SIZE(lbp3010_gpio_init), NULL, 0);
 	lbp2900_wait_ready(state->ops);
@@ -266,7 +267,8 @@ static void lbp3000_job_prologue(struct printer_state_s *state)
 {
 	const struct capt_status_s *status;
 
-	state->sent_job_cont = false;
+	state->sent_job_cont_once = false;
+	state->cont_ticks_since_send = 0;
 	state->printer_page_offset = 0;
 
 	capt_get_printer_info(state);
@@ -284,7 +286,19 @@ static void lbp3000_job_prologue(struct printer_state_s *state)
 		usleep(200000);
 	}
 
+	/* The genuine Canon Linux driver (ccpd, verified 2026-07-14 via a real
+	 * USB capture on this exact printer) unconditionally sends
+	 * GetExtendedStatus TWICE, back to back, immediately before every
+	 * single ReserveUnit call -- 100% of the time, in all 6 of 6 captured
+	 * jobs. capt_get_xstatus() above only calls GetExtendedStatus
+	 * conditionally (when CAPT_FL_XSTATUS_CHANGED is set), so our own
+	 * immediate pre-Reserve probe was GetBasicStatus, never
+	 * GetExtendedStatus. Match Canon's unconditional double call here. */
+	capt_get_xstatus_only();
+	capt_get_xstatus_only();
+
 	job = capt_reserve_unit(state);
+	fprintf(stderr, "DEBUG: CAPT: this job's real CAPT JobID=%u\n", (unsigned)job);
 
 	capt_sendrecv(CAPT_SET_POWER_DOWN, lbp6000_job_init, ARRAY_SIZE(lbp6000_job_init), NULL, 0);
 	status = lbp2900_get_status(state->ops);
@@ -342,6 +356,7 @@ static void lbp3010_job_prologue(struct printer_state_s *state)
 
 	capt_sendrecv(CAPT_START_0, NULL, 0, NULL, 0);
 	job = capt_reserve_unit(state);
+	fprintf(stderr, "DEBUG: CAPT: this job's real CAPT JobID=%u\n", (unsigned)job);
 
 	capt_sendrecv(CAPT_SET_LED_STATUS, lbp3010_gpio_init, ARRAY_SIZE(lbp3010_gpio_init), NULL, 0);
 	lbp2900_wait_ready(state->ops);
@@ -359,6 +374,7 @@ static void lbp6000_job_prologue(struct printer_state_s *state)
 
 	capt_sendrecv(CAPT_START_0, NULL, 0, NULL, 0);
 	job = capt_reserve_unit(state);
+	fprintf(stderr, "DEBUG: CAPT: this job's real CAPT JobID=%u\n", (unsigned)job);
 
 	capt_sendrecv(CAPT_SET_LED_STATUS, lbp3010_gpio_init, ARRAY_SIZE(lbp3010_gpio_init), NULL, 0);
 	lbp2900_wait_ready(state->ops);
@@ -484,12 +500,18 @@ static bool lbp2900_page_prologue(struct printer_state_s *state, const struct pa
 	 * Total: 40 bytes for LBP3000 (CNTblModel=1)
 	 */
 	uint8_t pageparms[] = {
-		/* idx  0- 7 */
-		0x00, 0x00, 0x30, 0x2A, sz, 0x00, 0x00, 0x00,
-		/* idx  8-15: TonerDensity, PaperType, ResFlag=0x11, Fixed_04, Fixed_00 */
-		td, 0x1C, 0x1C, 0x1C, paper_type, dims->media_adapt, 0x04, 0x00,
-		/* idx 16-23: Fixed_01, Fixed_01b, SuperSmooth=0x02, TonerSave, Unk21=0x00, 0x00, MarginW LE */
-		0x01, 0x01, 0x02, save, 0x00, 0x00,
+		/* idx  0- 7. idx5 verified 0x01 (not 0x00) in a genuine Canon
+		 * Linux driver capture on this exact printer, 2026-07-14. */
+		0x00, 0x00, 0x30, 0x2A, sz, 0x01, 0x00, 0x00,
+		/* idx  8-15: TonerDensity (all 4 bytes = td, per protocol §2.14 --
+		 * previously idx9-11 were hardcoded 0x1C regardless of td, which
+		 * only coincidentally looked uniform when td itself was 0x1C),
+		 * PaperType, ResFlag=0x11, Fixed_04, Fixed_00 */
+		td, td, td, td, paper_type, dims->media_adapt, 0x04, 0x00,
+		/* idx 16-23: Fixed_01, Fixed_01b, SuperSmooth=0x02, TonerSave,
+		 * idx20 verified 0x01 (not 0x00, "Unk21") in the same genuine
+		 * Canon Linux driver capture, 0x00, MarginW LE */
+		0x01, 0x01, 0x02, save, 0x01, 0x00,
 		LO(dims->margin_width), HI(dims->margin_width),
 		/* idx 24-31: MarginH LE, LineSize LE, ImgHeight LE */
 		LO(dims->margin_height), HI(dims->margin_height),
@@ -697,11 +719,21 @@ static bool lbp2900_page_epilogue(struct printer_state_s *state, const struct pa
 	while (1) {
 		status = lbp2900_get_status(state->ops);
 
-		/* SetJobInfo2(flag=2): send ONCE at first inter-page idle when Printed >= 1.
-		 * Spec §5, §11, §14 Rule 13: fire after StartPrint, during between-pages wait. */
-		if (!state->sent_job_cont && status->page_completed >= 1) {
-			send_job_start(CAPT_JOBFLAG_CONT);
-			state->sent_job_cont = true;
+		/* SetJobInfo2(flag=CONT) heartbeat: the genuine Canon Linux driver
+		 * (ccpd, verified 2026-07-14 via a real USB capture on this exact
+		 * printer) sends this repeatedly roughly every ~500ms throughout
+		 * the ENTIRE physical printing duration of a job (dozens of times
+		 * for a 2-page job spanning ~18s) -- not just once. This loop
+		 * already polls status every 100ms, so fire the heartbeat every
+		 * 5th iteration once the printer has started actually printing. */
+		if (status->page_completed >= 1) {
+			if (!state->sent_job_cont_once || state->cont_ticks_since_send >= 5) {
+				send_job_start(CAPT_JOBFLAG_CONT);
+				state->sent_job_cont_once = true;
+				state->cont_ticks_since_send = 0;
+			} else {
+				state->cont_ticks_since_send++;
+			}
 		}
 
 		/* Return as soon as the Printing counter reaches this page — the printer
@@ -783,9 +815,14 @@ static void lbp2900_job_epilogue(struct printer_state_s *state)
 
 	/* SetJobInfo2(flag=3): send immediately after last page's IC_BLACK_END.
 	 * Spec §9, §11, §14 Rule 14: do NOT wait for Printed==totalPages first.
-	 * GetExtendedStatus first to confirm final state, then send flag=3. */
+	 * GetExtendedStatus first to confirm final state, then send flag=3.
+	 * Use CAPT_JOBFLAG_END_LIN (3), not CAPT_JOBFLAG_END (6, "Windows
+	 * canonical") -- a genuine Canon Linux driver capture on this exact
+	 * printer (2026-07-14) confirmed the real Linux driver always sends
+	 * 3 for job-end, never 6; this call site had drifted from the
+	 * comment's own stated intent. */
 	capt_get_xstatus_only();
-	send_job_start(CAPT_JOBFLAG_END);
+	send_job_start(CAPT_JOBFLAG_END_LIN);
 
 	capt_sendrecv(CAPT_RELEASE_UNIT, jbuf, 2, NULL, 0);
 

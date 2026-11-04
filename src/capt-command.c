@@ -27,6 +27,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>	/* memmove() -- reply-stream resync in capt_sendrecv */
 
 #include <unistd.h>
 
@@ -35,6 +36,12 @@
 
 static uint8_t capt_iobuf[0x10000];
 static size_t  capt_iosize;
+
+/* Max bytes capt_sendrecv() will discard while trying to realign a reply
+ * stream that a late reply from the previous job has shifted (see the resync
+ * block in capt_sendrecv). A stale status/heartbeat reply is only a few dozen
+ * bytes; anything beyond this is a genuinely broken stream, not a shift. */
+#define CAPT_RESYNC_MAX_BYTES 256
 
 static void capt_debug_buf(const char *level, size_t size)
 {
@@ -89,20 +96,65 @@ static void capt_send_buf(void)
 	}
 }
 
+/*
+ * Read exactly `expected` bytes into capt_iobuf at `offset`.
+ *
+ * cupsBackChannelRead() returns however many bytes happen to be available at
+ * that moment -- a SHORT READ is a normal, legal outcome, not an error. The
+ * original upstream code issued a single read and assumed it returned
+ * everything, then capt_sendrecv() saw capt_iosize != 6, declared "bad reply
+ * from printer" and exit(1)'d -- while the rest of the reply was still sitting
+ * in the back-channel pipe, desynchronising every later read.
+ *
+ * This is defensive hardening, not the fix for the "bad reply from printer"
+ * failures seen on this printer: instrumenting the loop on real hardware
+ * (2026-07-22) showed the short-read path never actually triggered, and those
+ * failures turned out to be a reply-stream misalignment instead -- see the
+ * resync block in capt_sendrecv(). The loop is kept anyway because a short
+ * read is a legal return from cupsBackChannelRead() that the original code
+ * would have mishandled.
+ *
+ * Only a genuine stall (no data at all for the whole timeout) is a failure.
+ */
 static void capt_recv_buf(size_t offset, size_t expected)
 {
-	ssize_t size;
+	size_t got = 0;
+	int idle_rounds = 0;
+
 	if (offset + expected > sizeof(capt_iobuf)) {
 		fprintf(stderr, "ALERT: bug in CAPT driver, input buffer overflow\n");
 		exit(1);
 	}
 	fprintf(stderr, "DEBUG: CAPT: waiting for %u bytes\n", (unsigned) expected);
-	size = cupsBackChannelRead((char *) capt_iobuf + offset, expected, 15.0);
-	if (size < 0) {
-		fprintf(stderr, "ERROR: CAPT: no reply from printer\n");
-		exit(1);
+
+	while (got < expected) {
+		ssize_t size = cupsBackChannelRead((char *) capt_iobuf + offset + got,
+						   expected - got, 15.0);
+		if (size < 0) {
+			fprintf(stderr, "ERROR: CAPT: no reply from printer\n");
+			exit(1);
+		}
+		if (size == 0) {
+			/* Timed out with nothing new. Allow a couple of retries so a
+			 * momentarily slow printer does not kill the job, but do not
+			 * spin forever. */
+			if (++idle_rounds >= 3) {
+				fprintf(stderr, "ERROR: CAPT: incomplete reply from printer "
+						"(got %u of %u bytes)\n",
+					(unsigned) got, (unsigned) expected);
+				exit(1);
+			}
+			continue;
+		}
+		idle_rounds = 0;
+		got += (size_t) size;
+		if (got < expected)
+			fprintf(stderr, "DEBUG: CAPT: short read, have %u of %u bytes, "
+					"waiting for the rest\n",
+				(unsigned) got, (unsigned) expected);
 	}
-	capt_iosize = offset + size;
+
+	capt_iosize = offset + got;
 }
 
 const char *capt_identify(void)
@@ -153,10 +205,57 @@ void capt_sendrecv(uint16_t cmd, const void *buf, size_t size, void *reply, size
 	capt_send(cmd, buf, size);
 	capt_recv_buf(0, 6);
 	if (capt_iosize != 6 || WORD(capt_iobuf[0], capt_iobuf[1]) != cmd) {
-		fprintf(stderr, "ERROR: CAPT: bad reply from printer, "
+		/*
+		 * The reply stream is misaligned: what we just read is not the
+		 * header of OUR reply.
+		 *
+		 * Cause (diagnosed on real hardware 2026-07-22): the previous job's
+		 * filter can exit while the printer is still pushing out a reply to
+		 * one of its trailing SetJobInfo2 heartbeats / status polls. Because
+		 * captd keeps ONE USB session open across all jobs (that persistence
+		 * is exactly what stops the job-5 engine wedge), those late bytes are
+		 * still queued when the next job starts, so the new job's first read
+		 * returns the tail of the old job's reply and every read after it is
+		 * shifted. Typical signature:
+		 *     expected A1 A0 xx xx xx xx, got D0 00 00 02 B0 09
+		 *
+		 * captd drains the endpoint on both connect and disconnect, but a
+		 * drain is time-based and therefore inherently racy -- a reply that
+		 * lands just after the drain still slips through (measured: ~1 job in
+		 * 40 even with a 400ms settle delay).
+		 *
+		 * So recover here instead of dying: slide the window forward one byte
+		 * at a time until the expected command word appears. The stale reply
+		 * is consumed in the process and the stream is back in sync. Bounded,
+		 * so a genuinely broken stream still fails loudly rather than
+		 * spinning forever.
+		 *
+		 * Upstream simply exit(1)'d here, which killed the whole print job.
+		 */
+		unsigned shifts = 0;
+		int resynced = 0;
+
+		fprintf(stderr, "WARNING: CAPT: reply stream out of sync, "
 				"expected %02X %02X xx xx xx xx, got", LO(cmd), HI(cmd));
-		capt_debug_buf("ERROR", 6);
-		exit(1);
+		capt_debug_buf("WARNING", 6);
+
+		while (capt_iosize == 6 && shifts < CAPT_RESYNC_MAX_BYTES) {
+			memmove(capt_iobuf, capt_iobuf + 1, 5);
+			capt_recv_buf(5, 1);
+			shifts++;
+			if (capt_iosize == 6 && WORD(capt_iobuf[0], capt_iobuf[1]) == cmd) {
+				resynced = 1;
+				break;
+			}
+		}
+
+		if (!resynced) {
+			fprintf(stderr, "ERROR: CAPT: could not resynchronise reply "
+					"stream after %u byte(s), giving up\n", shifts);
+			exit(1);
+		}
+		fprintf(stderr, "WARNING: CAPT: reply stream resynchronised after "
+				"discarding %u stale byte(s) -- job continues\n", shifts);
 	}
 	while (1) {
 		if (WORD(capt_iobuf[2], capt_iobuf[3]) == capt_iosize)

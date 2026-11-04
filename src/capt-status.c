@@ -34,6 +34,11 @@ static inline char bit(enum capt_flags flag)
 	return FLAG(&status, flag) ? '1' : '0';
 }
 
+static inline char bitof(const struct capt_status_s *s, enum capt_flags flag)
+{
+	return FLAG(s, flag) ? '1' : '0';
+}
+
 #ifdef DEBUG
 static void print_status(void)
 {
@@ -135,24 +140,109 @@ const struct capt_status_s *capt_get_xstatus(void)
 	return &status;
 }
 
+/*
+ * Rich, single-line status dump for forensic correlation of engine wedges:
+ * decodes BufLevel and the Aux/Cnt/Pap/Eng engine bytes plus the key
+ * CAPT_FL_* bits from a GetBasicStatus/GetExtendedStatus reply.  Used at
+ * ReserveUnit failure/recovery points and at the bounded-wait timeouts below
+ * so a future incident leaves more than a single collapsed status byte in
+ * the log.
+ */
+void capt_log_status(const char *tag, const struct capt_status_s *s)
+{
+	fprintf(stderr,
+		"%s: status=0x%04x [ERR=%c OFFLINE=%c BUSY=%c IMBUSY=%c NOTRDY=%c FREE=%c UFREE=%c] "
+		"buf=%u aux=0x%02x cnt=0x%02x pap=0x%02x eng=0x%04x\n",
+		tag, s->status[0],
+		bitof(s, CAPT_FL_ERROR), bitof(s, CAPT_FL_OFFLINE), bitof(s, CAPT_FL_CMD_BUSY),
+		bitof(s, CAPT_FL_IM_DATA_BUSY), bitof(s, CAPT_FL_NOTREADY), bitof(s, CAPT_FL_PRINTER_FREE),
+		bitof(s, CAPT_FL_UNIT_FREE),
+		CAPT_BUFLEVEL_SLOTS(s->buf_level), s->aux, s->xstat_cnt, s->xstat_pap, s->xstat_eng);
+}
+
+/*
+ * Shared bounded wait for CMD_BUSY to clear, used by capt_wait_ready(),
+ * capt_wait_xready() and capt_wait_xready_only().  These used to loop
+ * forever on CMD_BUSY alone and never looked at CAPT_FL_ERROR: a wedge
+ * where CMD_BUSY never clears would hang the backend process indefinitely
+ * with zero visibility, and one that clears while ERROR is also set would
+ * go unnoticed.  Logs once (edge-triggered) if ERROR appears mid-wait, and
+ * bounds the loop so a genuine wedge is reported instead of hanging.
+ */
+static void capt_wait_busy_clear(const struct capt_status_s *(*getter)(void), const char *name)
+{
+	unsigned waited_ms = 0;
+	bool err_logged = false;
+	const struct capt_status_s *s;
+
+	while (1) {
+		s = getter();
+		if (!FLAG(s, CAPT_FL_CMD_BUSY))
+			return;
+		if (FLAG(s, CAPT_FL_ERROR) && !err_logged) {
+			capt_log_status(name, s);
+			err_logged = true;
+		}
+		if (waited_ms >= CAPT_WAIT_READY_TIMEOUT_MS) {
+			fprintf(stderr, "ERROR: CAPT: %s: timed out after %ums, CMD_BUSY still set\n",
+				name, (unsigned) CAPT_WAIT_READY_TIMEOUT_MS);
+			capt_log_status(name, s);
+			return;
+		}
+		usleep(100000);
+		waited_ms += 100;
+	}
+}
+
 void capt_wait_ready(void)
 {
 	/* Fix 7: Poll GetBasicStatus; wait until CMD_BUSY (0x04) clears.
 	 * CAPT_FL_CMD_BUSY = _FL(0,2) = 0x04 = CMD_BUSY per protocol §2.4.
 	 * Before Phase 1 this was CAPT_FL_BUSY which mapped to ERROR_BIT (0x80)
 	 * and was therefore waiting for errors to clear, not command completion. */
-	while (FLAG(capt_get_status(), CAPT_FL_CMD_BUSY))
-		usleep(100000);
+	capt_wait_busy_clear(capt_get_status, "capt_wait_ready");
 }
 
 void capt_wait_xready(void)
 {
-	while (FLAG(capt_get_xstatus(), CAPT_FL_CMD_BUSY))
-		usleep(100000);
+	capt_wait_busy_clear(capt_get_xstatus, "capt_wait_xready");
 }
 
 void capt_wait_xready_only(void)
 {
-       while (FLAG(capt_get_xstatus_only(), CAPT_FL_CMD_BUSY))
-               usleep(100000);
+	capt_wait_busy_clear(capt_get_xstatus_only, "capt_wait_xready_only");
+}
+
+/*
+ * Wait for TRUE engine idle: CMD_BUSY, IM_DATA_BUSY and ERROR all clear, and
+ * RCF_PAPER_DELIVERY (Aux byte 9 bit 0x04, last sheet still physically
+ * feeding) also clear.  Used at job end (see lbp2900_job_epilogue()) instead
+ * of polling RCF_PAPER_DELIVERY alone, so the next job's ReserveUnit does
+ * not race into an engine that is still internally draining or already in
+ * an error state.  Mirrors the interleaved GetInputStatus + GetExtendedStatus
+ * polling the epilogue always used.  Bounded: returns false without aborting
+ * if the engine never reaches idle within timeout_ms, so the caller can log
+ * and decide -- a real wedge here cannot be fixed by waiting longer.
+ */
+bool capt_wait_engine_idle(unsigned timeout_ms)
+{
+	unsigned waited_ms = 0;
+	const struct capt_status_s *s;
+
+	while (1) {
+		capt_sendrecv(CAPT_GET_INPUT_STATUS, NULL, 0, NULL, 0);
+		s = capt_get_xstatus_only();
+
+		if (!FLAG(s, CAPT_FL_CMD_BUSY)
+				&& !FLAG(s, CAPT_FL_IM_DATA_BUSY)
+				&& !FLAG(s, CAPT_FL_ERROR)
+				&& !(s->aux & CAPT_AUX_PAPER_DELIVERY))
+			return true;
+
+		if (waited_ms >= timeout_ms)
+			return false;
+
+		usleep(100000);
+		waited_ms += 100;
+	}
 }

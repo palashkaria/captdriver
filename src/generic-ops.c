@@ -40,6 +40,60 @@ size_t ops_compress_band_hiscoa(struct printer_state_s *state,
 					last_band_page_end, &hiscoa_default_params);
 }
 
+/*
+ * Bounded, backed-off wait for BufLevel (GetBasicStatus/GetExtendedStatus
+ * bytes 5-6 low nibble) to rise above 0.  Used at the two BufLevel==0 drain
+ * points in ops_send_band_hiscoa() below.  This loop previously had no sleep
+ * at all -- a tight spin hammering the USB bus with GetBasicStatus -- and no
+ * bound: a genuine printer stall here hung the backend process forever,
+ * since capt_recv_buf()'s unrelated 15s single-read USB timeout never trips
+ * as long as the printer keeps answering status requests with "still 0".
+ * Logs full diagnostics and aborts cleanly if BufLevel never recovers within
+ * CAPT_BUFLEVEL_DRAIN_TIMEOUT_MS, instead of spinning or proceeding silently.
+ */
+static void drain_until_buflevel_nonzero(struct printer_state_s *state,
+		const struct capt_status_s **pstatus, int *pbuflevel_slots)
+{
+	const struct capt_status_s *status = *pstatus;
+	int buflevel_slots = *pbuflevel_slots;
+	uint8_t prev_byte1 = (uint8_t)(status->status[0] & 0xFF);
+	unsigned waited_ms = 0;
+	unsigned poll_ms = 100;
+
+	while (buflevel_slots == 0) {
+		usleep(poll_ms * 1000);
+		waited_ms += poll_ms;
+		if (poll_ms < 500)
+			poll_ms += 100; /* back off toward 500ms between polls */
+
+		status = capt_get_status();
+		buflevel_slots = CAPT_BUFLEVEL_SLOTS(status->buf_level);
+
+		/* Track byte1 changes during drain (spec §4.3, §8 observation). */
+		uint8_t cur_byte1 = (uint8_t)(status->status[0] & 0xFF);
+		if (cur_byte1 != prev_byte1) {
+			prev_byte1 = cur_byte1;
+			status = capt_get_xstatus_only();
+			buflevel_slots = CAPT_BUFLEVEL_SLOTS(status->buf_level);
+			if (FLAG(status, CAPT_FL_NEED_INPUT_STATUS))
+				capt_sendrecv(CAPT_GET_INPUT_STATUS, NULL, 0, NULL, 0);
+		}
+
+		if (buflevel_slots != 0)
+			break;
+
+		if (waited_ms >= CAPT_BUFLEVEL_DRAIN_TIMEOUT_MS) {
+			fprintf(stderr, "ERROR: CAPT: BufLevel stuck at 0 for %ums on page %u -- aborting\n",
+				waited_ms, state->ipage);
+			capt_log_status("ERROR: CAPT: BufLevel drain timeout", status);
+			exit(1);
+		}
+	}
+
+	*pstatus = status;
+	*pbuflevel_slots = buflevel_slots;
+}
+
 void ops_send_band_hiscoa(struct printer_state_s *state, const void *data, size_t size)
 {
 	const uint8_t *pdata = (const uint8_t *) data;
@@ -84,27 +138,13 @@ void ops_send_band_hiscoa(struct printer_state_s *state, const void *data, size_
 					state->startprint_sent = true;
 				}
 			}
-			/* Poll until BufLevel rises to >= 1.
-			 * Track byte1 changes: when byte1 changes, call GetExtendedStatus so
+			/* Poll until BufLevel rises to >= 1, bounded and backed off (see
+			 * drain_until_buflevel_nonzero()): a genuine stall here used to
+			 * spin capt_get_status() with no sleep and no way out.  Track
+			 * byte1 changes: when byte1 changes, call GetExtendedStatus so
 			 * the driver observes Start counter advancing to N+1 during drain.
 			 * Spec §4.3: optionally call GetExtendedStatus on byte1 change. */
-			{
-				uint8_t prev_byte1 = (uint8_t)(status->status[0] & 0xFF);
-				do {
-					status = capt_get_status();
-					buflevel_slots = CAPT_BUFLEVEL_SLOTS(status->buf_level);
-					{
-						uint8_t cur_byte1 = (uint8_t)(status->status[0] & 0xFF);
-						if (cur_byte1 != prev_byte1) {
-							prev_byte1 = cur_byte1;
-							status = capt_get_xstatus_only();
-							buflevel_slots = CAPT_BUFLEVEL_SLOTS(status->buf_level);
-							if (FLAG(status, CAPT_FL_NEED_INPUT_STATUS))
-								capt_sendrecv(CAPT_GET_INPUT_STATUS, NULL, 0, NULL, 0);
-						}
-					}
-				} while (buflevel_slots == 0);
-			}
+			drain_until_buflevel_nonzero(state, &status, &buflevel_slots);
 			chunks_since_poll = 0;
 		}
 
@@ -163,23 +203,10 @@ void ops_send_band_hiscoa(struct printer_state_s *state, const void *data, size_
 
 	/* Final BufLevel drain check for IC_BLACK_END.
 	 * In streaming mode, StartPrint was sent above, so engine will consume and BufLevel will rise.
-	 * In normal mode, BufLevel should already be >= 1. */
-	if (buflevel_slots == 0) {
-		uint8_t prev_byte1 = (uint8_t)(status->status[0] & 0xFF);
-		do {
-			status = capt_get_status();
-			buflevel_slots = CAPT_BUFLEVEL_SLOTS(status->buf_level);
-			/* Track byte1 changes during drain (spec §4.3, §8 observation). */
-			uint8_t cur_byte1 = (uint8_t)(status->status[0] & 0xFF);
-			if (cur_byte1 != prev_byte1) {
-				prev_byte1 = cur_byte1;
-				status = capt_get_xstatus_only();
-				buflevel_slots = CAPT_BUFLEVEL_SLOTS(status->buf_level);
-				if (FLAG(status, CAPT_FL_NEED_INPUT_STATUS))
-					capt_sendrecv(CAPT_GET_INPUT_STATUS, NULL, 0, NULL, 0);
-			}
-		} while (buflevel_slots == 0);
-	}
+	 * In normal mode, BufLevel should already be >= 1.  Bounded/backed-off,
+	 * see drain_until_buflevel_nonzero(). */
+	if (buflevel_slots == 0)
+		drain_until_buflevel_nonzero(state, &status, &buflevel_slots);
 
 	fprintf(stderr, "DEBUG: CAPT: IC_VIDEO_DATA done, streaming=%d, buflevel=%d\n",
 		(int)state->startprint_sent, buflevel_slots);

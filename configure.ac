@@ -18,7 +18,26 @@ CUPS_LIBS="`${CUPS_CONFIG} --image --libs`"
 AC_SUBST(CUPS_CFLAGS)
 AC_SUBST(CUPS_LIBS)
 
+AC_ARG_WITH([cups-serverbin],
+    [AS_HELP_STRING([--with-cups-serverbin=DIR], [CUPS filter/backend directory])],
+    [CUPS_SERVERBIN="$withval"], [CUPS_SERVERBIN="`$CUPS_CONFIG --serverbin`"])
+AC_SUBST([CUPS_SERVERBIN])
+AC_ARG_ENABLE([persistent-usb],
+    [AS_HELP_STRING([--enable-persistent-usb], [build Linux LBP2900 persistent USB daemon/backend])],
+    [], [enable_persistent_usb=no])
+AS_CASE([$enable_persistent_usb], [yes|no], [],
+    [AC_MSG_ERROR([--enable-persistent-usb must be yes or no])])
+AM_CONDITIONAL([PERSISTENT_USB], [test "x$enable_persistent_usb" = xyes])
+AS_IF([test "x$enable_persistent_usb" = xyes], [
+    PKG_CHECK_MODULES([LIBUSB], [libusb-1.0])
+])
+AC_ARG_WITH([systemdunitdir],
+    [AS_HELP_STRING([--with-systemdunitdir=DIR], [systemd service unit directory])],
+    [SYSTEMD_UNITDIR="$withval"], [SYSTEMD_UNITDIR='${prefix}/lib/systemd/system'])
+AC_SUBST([SYSTEMD_UNITDIR])
+
 AC_CONFIG_FILES([Makefile
+                 persistent/Makefile
                  src/Makefile
                  tests/Makefile
                 ])
